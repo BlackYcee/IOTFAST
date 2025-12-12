@@ -2,15 +2,14 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
 
-# --- CONFIGURACIÓN BASE DE DATOS (SQLITE) ---
+# --- CONFIGURACIÓN BASE DE DATOS ---
 SQLALCHEMY_DATABASE_URL = "sqlite:///./condominio.db"
 
-# check_same_thread=False es necesario para SQLite en FastAPI
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
@@ -20,93 +19,73 @@ Base = declarative_base()
 app = FastAPI(title="Sistema Control de Acceso Condominio IoT")
 
 # ==========================================
-# 1. MODELOS DE BASE DE DATOS (TABLAS)
+# 1. MODELOS DE BASE DE DATOS
 # ==========================================
 
 class DepartamentoDB(Base):
     __tablename__ = "departamentos"
-    
     id_departamento = Column(Integer, primary_key=True, index=True)
-    numero = Column(String, index=True)  # Ej: "101"
-    torre = Column(String)               # Ej: "A"
-    otros_datos = Column(String, nullable=True) # Ej: "Piso 1"
-
-    # Relaciones (para facilitar consultas)
+    numero = Column(String, index=True)
+    torre = Column(String)
+    otros_datos = Column(String, nullable=True)
     usuarios = relationship("UsuarioDB", back_populates="departamento")
     sensores = relationship("SensorDB", back_populates="departamento")
 
 class UsuarioDB(Base):
     __tablename__ = "usuarios"
-    
     id_usuario = Column(Integer, primary_key=True, index=True)
     nombre = Column(String)
     email = Column(String, unique=True, index=True)
-    password_hash = Column(String) # En producción usar bcrypt
-    estado = Column(String, default="ACTIVO") # ACTIVO / INACTIVO / BLOQUEADO
-    rol = Column(String, default="OPERADOR")  # ADMINISTRADOR / OPERADOR
-    otros_datos = Column(String, nullable=True) # Teléfono, Rut
-    
-    # FK necesaria para relacionar usuario con depto
+    password_hash = Column(String)
+    estado = Column(String, default="ACTIVO") 
+    rol = Column(String, default="OPERADOR") # ADMINISTRADOR / OPERADOR
     id_departamento = Column(Integer, ForeignKey("departamentos.id_departamento"))
-    
     departamento = relationship("DepartamentoDB", back_populates="usuarios")
     sensores = relationship("SensorDB", back_populates="usuario")
 
 class SensorDB(Base):
     __tablename__ = "sensores"
-    
     id_sensor = Column(Integer, primary_key=True, index=True)
-    codigo_sensor = Column(String, unique=True, index=True) # UID/MAC
-    estado = Column(String, default="ACTIVO") # ACTIVO / INACTIVO / PERDIDO / BLOQUEADO
-    tipo = Column(String) # Llavero / Tarjeta
+    codigo_sensor = Column(String, unique=True, index=True) # MAC/UID
+    estado = Column(String, default="ACTIVO") # ACTIVO / INACTIVO / PERDIDO
+    tipo = Column(String) # Tarjeta / Llavero
     fecha_alta = Column(DateTime, default=func.now())
-    fecha_baja = Column(DateTime, nullable=True)
-    
     id_departamento = Column(Integer, ForeignKey("departamentos.id_departamento"))
-    # FK opcional para asignar sensor a un usuario específico
     id_usuario = Column(Integer, ForeignKey("usuarios.id_usuario"), nullable=True)
-
     departamento = relationship("DepartamentoDB", back_populates="sensores")
     usuario = relationship("UsuarioDB", back_populates="sensores")
 
 class EventoAccesoDB(Base):
     __tablename__ = "eventos_acceso"
-    
     id_evento = Column(Integer, primary_key=True, index=True)
     tipo_evento = Column(String) 
-    # Tipos: ACCESO_VALIDO, ACCESO_RECHAZADO, APERTURA_MANUAL, CIERRE_MANUAL
     fecha_hora = Column(DateTime, default=func.now())
     resultado = Column(String) # PERMITIDO / DENEGADO
-    
-    # Claves foráneas
     id_sensor = Column(Integer, ForeignKey("sensores.id_sensor"), nullable=True)
     id_usuario = Column(Integer, ForeignKey("usuarios.id_usuario"), nullable=True)
 
-# Crear todas las tablas
 Base.metadata.create_all(bind=engine)
 
 # ==========================================
-# 2. SCHEMAS PYDANTIC (VALIDACIÓN DE DATOS)
+# 2. SCHEMAS PYDANTIC (Requests)
 # ==========================================
 
-# Request desde el NodeMCU
 class ValidacionRequest(BaseModel):
     uid: str 
 
-# Request desde la App para abrir manual
-class AperturaManualRequest(BaseModel):
-    id_usuario: int # Quién abrió desde la app
+class SensorCreateRequest(BaseModel):
+    admin_id: int # ID del admin que hace la operacion
+    codigo_sensor: str
+    tipo: str # Tarjeta / Llavero
+    id_usuario_asignado: int # A quien pertenece el sensor
 
-# Request para crear sensores (Admin)
-class SensorCreate(BaseModel):
-    codigo: str
-    tipo: str
-    id_departamento: int
+class SensorEstadoRequest(BaseModel):
+    admin_id: int
+    nuevo_estado: str # ACTIVO / INACTIVO / PERDIDO
+
+class BarreraManualRequest(BaseModel):
     id_usuario: int
-
-# ==========================================
-# 3. LÓGICA / ENDPOINTS
-# ==========================================
+    accion: str # ABRIR / CERRAR
 
 def get_db():
     db = SessionLocal()
@@ -115,118 +94,142 @@ def get_db():
     finally:
         db.close()
 
+# ==========================================
+# 3. ENDPOINTS DE NEGOCIO
+# ==========================================
+
 @app.get("/")
 def root():
-    return {"status": "Sistema Online", "db": "SQLite Configurada"}
+    return {"status": "Sistema Online", "version": "1.0.0"}
 
-# --- ENDPOINT 1: VALIDACIÓN RFID (Para NodeMCU) ---
+# --- A. VALIDACIÓN ACCESO (NodeMCU) ---
 @app.post("/api/validar-acceso")
-def validar_acceso(request: ValidacionRequest, db: Session = Depends(get_db)):
-    """
-    Recibe el UID de la tarjeta, verifica en BD y registra el evento.
-    """
+def validar_acceso(req: ValidacionRequest, db: Session = Depends(get_db)):
     # 1. Buscar sensor
-    sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == request.uid).first()
+    sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == req.uid).first()
     
     nuevo_evento = EventoAccesoDB(
         fecha_hora=datetime.now(),
-        tipo_evento="ACCESO_RECHAZADO",
+        tipo_evento="ACCESO_RFID",
         resultado="DENEGADO"
     )
 
     if not sensor:
-        # Tarjeta desconocida
-        nuevo_evento.tipo_evento = "ACCESO_RECHAZADO"
-        nuevo_evento.resultado = "DENEGADO"
+        nuevo_evento.resultado = "DENEGADO_SENSOR_NO_REGISTRADO"
         db.add(nuevo_evento)
         db.commit()
-        return {"acceso": False, "mensaje": "Sensor no registrado"}
+        return {"acceso": False, "mensaje": "Sensor No Registrado"}
 
-    # Asociar datos al evento
     nuevo_evento.id_sensor = sensor.id_sensor
-    nuevo_evento.id_usuario = sensor.id_usuario # Si tiene dueño
-    
-    # 2. Verificar estado
-    if sensor.estado == "ACTIVO":
-        # Verificar estado del usuario dueño (Opcional pero recomendado)
-        usuario_dueno = db.query(UsuarioDB).filter(UsuarioDB.id_usuario == sensor.id_usuario).first()
-        if usuario_dueno and usuario_dueno.estado != "ACTIVO":
-             nuevo_evento.tipo_evento = "ACCESO_RECHAZADO"
-             nuevo_evento.resultado = "DENEGADO_USUARIO_BLOQUEADO"
-             db.add(nuevo_evento)
-             db.commit()
-             return {"acceso": False, "mensaje": "Usuario bloqueado"}
+    nuevo_evento.id_usuario = sensor.id_usuario
 
-        # ACCESO CONCEDIDO
-        nuevo_evento.tipo_evento = "ACCESO_VALIDO"
-        nuevo_evento.resultado = "PERMITIDO"
-        db.add(nuevo_evento)
-        db.commit()
-        return {"acceso": True, "mensaje": "Bienvenido"}
-    
-    else:
-        # Sensor inactivo/perdido
-        nuevo_evento.tipo_evento = "ACCESO_RECHAZADO"
+    # 2. Validar Estado del Sensor
+    if sensor.estado != "ACTIVO":
         nuevo_evento.resultado = f"DENEGADO_SENSOR_{sensor.estado}"
         db.add(nuevo_evento)
         db.commit()
         return {"acceso": False, "mensaje": f"Sensor {sensor.estado}"}
 
-# --- ENDPOINT 2: APERTURA MANUAL DESDE APP ---
-@app.post("/api/apertura-manual")
-def apertura_manual(req: AperturaManualRequest, db: Session = Depends(get_db)):
+    # 3. Validar Estado del Usuario Dueño
+    usuario = db.query(UsuarioDB).filter(UsuarioDB.id_usuario == sensor.id_usuario).first()
+    if usuario and usuario.estado != "ACTIVO":
+        nuevo_evento.resultado = "DENEGADO_USUARIO_BLOQUEADO"
+        db.add(nuevo_evento)
+        db.commit()
+        return {"acceso": False, "mensaje": "Usuario Bloqueado"}
+
+    # 4. Acceso Permitido
+    nuevo_evento.resultado = "PERMITIDO"
+    nuevo_evento.tipo_evento = "ACCESO_VALIDO"
+    db.add(nuevo_evento)
+    db.commit()
+    return {"acceso": True, "mensaje": "Bienvenido"}
+
+# --- B. GESTIÓN DE SENSORES (APP - Solo Admin) ---
+@app.post("/api/sensores/crear")
+def registrar_sensor(req: SensorCreateRequest, db: Session = Depends(get_db)):
+    # Verificar si quien pide es admin
+    admin = db.query(UsuarioDB).filter(UsuarioDB.id_usuario == req.admin_id).first()
+    if not admin or admin.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403, detail="No tiene permisos de Administrador")
+
+    # Verificar existencia del sensor
+    if db.query(SensorDB).filter(SensorDB.codigo_sensor == req.codigo_sensor).first():
+        raise HTTPException(status_code=400, detail="El sensor ya existe")
+
+    # Crear sensor asociado al departamento del Admin
+    nuevo_sensor = SensorDB(
+        codigo_sensor=req.codigo_sensor,
+        tipo=req.tipo,
+        id_departamento=admin.id_departamento, # Se asocia al depto del admin
+        id_usuario=req.id_usuario_asignado,
+        estado="ACTIVO"
+    )
+    db.add(nuevo_sensor)
+    db.commit()
+    return {"mensaje": "Sensor registrado exitosamente"}
+
+@app.put("/api/sensores/{codigo}/estado")
+def cambiar_estado_sensor(codigo: str, req: SensorEstadoRequest, db: Session = Depends(get_db)):
+    # Verificar admin
+    admin = db.query(UsuarioDB).filter(UsuarioDB.id_usuario == req.admin_id).first()
+    if not admin or admin.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403, detail="Requiere Rol Administrador")
+
+    sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == codigo).first()
+    if not sensor:
+        raise HTTPException(status_code=404, detail="Sensor no encontrado")
+
+    # Validar que el sensor pertenezca al mismo departamento del admin
+    if sensor.id_departamento != admin.id_departamento:
+        raise HTTPException(status_code=403, detail="No puede gestionar sensores de otro departamento")
+
+    sensor.estado = req.nuevo_estado
+    db.commit()
+    return {"mensaje": f"Estado actualizado a {req.nuevo_estado}"}
+
+# --- C. CONTROL MANUAL BARRERA (APP) ---
+@app.post("/api/barrera/control")
+def control_barrera(req: BarreraManualRequest, db: Session = Depends(get_db)):
     usuario = db.query(UsuarioDB).filter(UsuarioDB.id_usuario == req.id_usuario).first()
     if not usuario:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-        
+        raise HTTPException(status_code=404, detail="Usuario desconocido")
+
+    # Registramos el evento
     evento = EventoAccesoDB(
         id_usuario=usuario.id_usuario,
-        tipo_evento="APERTURA_MANUAL",
+        tipo_evento=f"MANUAL_{req.accion}", # APERTURA_MANUAL o CIERRE_MANUAL
         resultado="PERMITIDO",
         fecha_hora=datetime.now()
     )
     db.add(evento)
     db.commit()
-    
-    # Aquí podrías usar MQTT o una variable global para avisar al NodeMCU
-    return {"mensaje": "Barrera abierta manualmente", "estado_barrera": "ABIERTA"}
 
-# --- ENDPOINT 3: CREAR DATOS DE PRUEBA (SOLO PARA INICIALIZAR) ---
-@app.post("/setup-datos-prueba")
-def setup_datos(db: Session = Depends(get_db)):
-    # Crear depto
-    depto = DepartamentoDB(numero="101", torre="A", otros_datos="Piso 1")
-    db.add(depto)
-    db.commit()
-    db.refresh(depto)
-    
-    # Crear Usuario Admin
-    admin = UsuarioDB(
-        nombre="Juan Admin", 
-        email="juan@admin.com", 
-        password_hash="secret", 
-        rol="ADMINISTRADOR",
-        id_departamento=depto.id_departamento
-    )
-    db.add(admin)
-    db.commit()
-    db.refresh(admin)
-    
-    # Crear Sensor
-    sensor = SensorDB(
-        codigo_sensor="A3 BC 12", # EJEMPLO DE MAC
-        tipo="Tarjeta",
-        id_departamento=depto.id_departamento,
-        id_usuario=admin.id_usuario
-    )
-    db.add(sensor)
-    db.commit()
-    
-    return {"mensaje": "Datos creados: Depto 101, Usuario Juan, Sensor A3 BC 12"}
+    # Logica de respuesta para la App (que luego notificará al NodeMCU via MQTT o polling)
+    return {"estado_barrera": "ABIERTA" if req.accion == "ABRIR" else "CERRADA", "mensaje": "Comando enviado"}
 
-# --- ENDPOINT 4: VER HISTORIAL ---
+# --- D. HISTORIAL Y DATOS ---
 @app.get("/api/historial")
 def ver_historial(db: Session = Depends(get_db)):
-    # Devuelve los últimos 20 eventos
-    eventos = db.query(EventoAccesoDB).order_by(EventoAccesoDB.fecha_hora.desc()).limit(20).all()
-    return eventos
+    return db.query(EventoAccesoDB).order_by(EventoAccesoDB.fecha_hora.desc()).limit(20).all()
+
+@app.post("/setup-inicial")
+def setup_inicial(db: Session = Depends(get_db)):
+    # Crear Depto y Admin por defecto para poder probar
+    if not db.query(DepartamentoDB).first():
+        depto = DepartamentoDB(numero="101", torre="A")
+        db.add(depto)
+        db.commit()
+        db.refresh(depto)
+        
+        admin = UsuarioDB(
+            nombre="Administrador Torre A",
+            email="admin@iot.com",
+            password_hash="123456",
+            rol="ADMINISTRADOR",
+            id_departamento=depto.id_departamento
+        )
+        db.add(admin)
+        db.commit()
+        return {"mensaje": "Datos iniciales creados. ID Admin: 1"}
+    return {"mensaje": "Datos ya existían"}
