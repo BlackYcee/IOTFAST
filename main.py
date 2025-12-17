@@ -11,28 +11,30 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 
 # --- CONFIGURACIÓN DE SEGURIDAD ---
-SECRET_KEY = "TU_SECRETO_SUPER_SEGURO_CAMBIALO" # En prod usa una variable de entorno
+SECRET_KEY = "PROYECTO_TITULO_SECRET_KEY" 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 120 # Token dura 2 horas para facilitar pruebas
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# --- BASE DE DATOS ---
-SQLALCHEMY_DATABASE_URL = "sqlite:///./condominio.db"
+# --- BASE DE DATOS (SQLite local para pruebas) ---
+SQLALCHEMY_DATABASE_URL = "sqlite:///./condominio_cloud.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="Sistema IoT Condominio - Secure")
+app = FastAPI(title="API Control de Acceso - Cloud Logic")
 
 # ==========================================
-# 1. MODELOS BD
+# 1. MODELOS BD (Estructura Sugerida Refinada)
 # ==========================================
+
 class DepartamentoDB(Base):
     __tablename__ = "departamentos"
     id_departamento = Column(Integer, primary_key=True, index=True)
-    numero = Column(String)
+    numero = Column(String) # Ej: "101"
+    torre = Column(String, nullable=True) # Ej: "A"
     usuarios = relationship("UsuarioDB", back_populates="departamento")
     sensores = relationship("SensorDB", back_populates="departamento")
 
@@ -42,35 +44,35 @@ class UsuarioDB(Base):
     email = Column(String, unique=True, index=True)
     nombre = Column(String)
     hashed_password = Column(String)
-    rol = Column(String, default="OPERADOR") # ADMINISTRADOR / OPERADOR
-    estado = Column(String, default="ACTIVO")
+    # ROLES: 'ADMINISTRADOR' (Jefe de depto) | 'OPERADOR' (Residente común)
+    rol = Column(String, default="OPERADOR") 
+    estado = Column(String, default="ACTIVO") # ACTIVO / INACTIVO
     id_departamento = Column(Integer, ForeignKey("departamentos.id_departamento"))
     departamento = relationship("DepartamentoDB", back_populates="usuarios")
 
 class SensorDB(Base):
     __tablename__ = "sensores"
     id_sensor = Column(Integer, primary_key=True, index=True)
-    codigo_sensor = Column(String, unique=True, index=True)
-    estado = Column(String, default="ACTIVO")
-    tipo = Column(String) 
+    codigo_sensor = Column(String, unique=True, index=True) # MAC o UID de la tarjeta
+    # ESTADOS: 'ACTIVO', 'INACTIVO', 'PERDIDO', 'BLOQUEADO'
+    estado = Column(String, default="ACTIVO") 
+    tipo = Column(String) # 'TARJETA' o 'LLAVERO'
+    fecha_alta = Column(DateTime, default=func.now())
+    
     id_departamento = Column(Integer, ForeignKey("departamentos.id_departamento"))
     departamento = relationship("DepartamentoDB", back_populates="sensores")
 
 class EventoAccesoDB(Base):
     __tablename__ = "eventos_acceso"
     id_evento = Column(Integer, primary_key=True, index=True)
-    tipo_evento = Column(String) 
     fecha_hora = Column(DateTime, default=func.now())
-    resultado = Column(String)
-    usuario_nombre = Column(String, nullable=True) # Guardamos nombre por facilidad histórica
-
-# Tabla para comandos pendientes hacia el ESP32
-class ComandoPendienteDB(Base):
-    __tablename__ = "comandos_pendientes"
-    id_comando = Column(Integer, primary_key=True, index=True)
-    destino = Column(String) # Puede ser id_departamento o MAC del ESP
-    accion = Column(String)  # ABRIR
-    procesado = Column(Boolean, default=False)
+    
+    # TIPO: 'RFID_VALIDO', 'RFID_DENEGADO', 'APP_ABRIR', 'APP_CERRAR'
+    tipo_evento = Column(String) 
+    resultado = Column(String) # PERMITIDO / DENEGADO
+    descripcion = Column(String) # Detalles: "Usuario Juan", "Tarjeta Desconocida", etc.
+    
+    id_departamento = Column(Integer, nullable=True) # Para filtrar historial por depto
 
 Base.metadata.create_all(bind=engine)
 
@@ -97,7 +99,7 @@ def create_access_token(data: dict):
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Credenciales inválidas",
+        detail="No se pudo validar las credenciales",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
@@ -112,7 +114,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     return user
 
 # ==========================================
-# 3. SCHEMAS (Pydantic)
+# 3. SCHEMAS (Pydantic para API)
 # ==========================================
 class Token(BaseModel):
     access_token: str
@@ -121,30 +123,82 @@ class Token(BaseModel):
     nombre: str
     id_departamento: int
 
+# Para crear sensores desde la App
 class SensorCreate(BaseModel):
-    codigo: str
-    tipo: str
+    codigo: str # UID RFID
+    tipo: str   # TARJETA / LLAVERO
 
+# Para cambiar estado (Activar/Desactivar/Perdido)
 class SensorUpdate(BaseModel):
-    estado: str
+    estado: str 
 
-class BarreraCmd(BaseModel):
-    accion: str # ABRIR
+# Para control manual de barrera
+class BarreraManual(BaseModel):
+    accion: str # "ABRIR" o "CERRAR"
+
+# Para simular el Hardware RFID enviando datos
+class SimulacionRFID(BaseModel):
+    uid: str
+
+# Salida de historial
+class EventoOut(BaseModel):
+    fecha_hora: datetime
+    tipo_evento: str
+    resultado: str
+    descripcion: str
+    class Config:
+        orm_mode = True
 
 # ==========================================
 # 4. ENDPOINTS
 # ==========================================
 
-# --- A. LOGIN (Para la App) ---
-@app.post("/token", response_model=Token)
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+# --- A. SETUP & LOGIN ---
+
+@app.post("/setup", tags=["Configuración"])
+def inicializar_datos_prueba(db: Session = Depends(get_db)):
+    """Crea datos base: Depto 101, 1 Admin y 1 Operador"""
+    if db.query(DepartamentoDB).filter_by(numero="101").first():
+        return {"msg": "Datos ya existen. Usa /token para loguearte."}
+
+    # 1. Crear Departamento
+    depto = DepartamentoDB(numero="101", torre="A")
+    db.add(depto)
+    db.commit()
+    db.refresh(depto)
+
+    # 2. Crear Admin (Jefe de hogar)
+    admin = UsuarioDB(
+        email="admin@condominio.cl", 
+        nombre="Jefe Depto 101", 
+        hashed_password=get_password_hash("admin123"), 
+        rol="ADMINISTRADOR", 
+        id_departamento=depto.id_departamento
+    )
+    
+    # 3. Crear Operador (Hijo/Residente)
+    user = UsuarioDB(
+        email="hijo@condominio.cl", 
+        nombre="Hijo Depto 101", 
+        hashed_password=get_password_hash("user123"), 
+        rol="OPERADOR", 
+        id_departamento=depto.id_departamento
+    )
+
+    db.add(admin)
+    db.add(user)
+    db.commit()
+    return {"msg": "Usuarios creados: admin@condominio.cl (pass: admin123) / hijo@condominio.cl (pass: user123)"}
+
+@app.post("/token", response_model=Token, tags=["Auth"])
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UsuarioDB).filter(UsuarioDB.email == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Email o contraseña incorrectos",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=400, detail="Credenciales incorrectas")
+    
+    if user.estado != "ACTIVO":
+        raise HTTPException(status_code=400, detail="Usuario inactivo o bloqueado")
+
     access_token = create_access_token(data={"sub": user.email})
     return {
         "access_token": access_token, 
@@ -154,135 +208,142 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
         "id_departamento": user.id_departamento
     }
 
-# --- B. GESTIÓN DE SENSORES (Solo Admin) ---
-@app.post("/api/sensores", status_code=201)
-def crear_sensor(sensor: SensorCreate, 
-                 current_user: UsuarioDB = Depends(get_current_user), 
-                 db: Session = Depends(get_db)):
-    
-    if current_user.rol != "ADMINISTRADOR":
-        raise HTTPException(status_code=403, detail="No autorizado")
+# --- B. GESTIÓN DE SENSORES (Req: Solo Admin del Depto) ---
 
-    db_sensor = SensorDB(
-        codigo_sensor=sensor.codigo, 
+@app.post("/api/sensores", tags=["Sensores"])
+def registrar_sensor(sensor: SensorCreate, 
+                     current_user: UsuarioDB = Depends(get_current_user), 
+                     db: Session = Depends(get_db)):
+    
+    # VALIDACIÓN DE ROL
+    if current_user.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403, detail="Solo el Administrador del depto puede agregar sensores")
+
+    # Verificar duplicados
+    if db.query(SensorDB).filter(SensorDB.codigo_sensor == sensor.codigo).first():
+        raise HTTPException(status_code=400, detail="Este código de sensor ya está registrado")
+
+    nuevo_sensor = SensorDB(
+        codigo_sensor=sensor.codigo,
         tipo=sensor.tipo,
+        estado="ACTIVO",
         id_departamento=current_user.id_departamento
     )
-    db.add(db_sensor)
+    db.add(nuevo_sensor)
     db.commit()
-    return {"msg": "Sensor creado"}
+    return {"msg": "Sensor registrado exitosamente", "codigo": sensor.codigo}
 
-@app.get("/api/sensores")
-def listar_sensores(current_user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Solo ve sensores de SU departamento
+@app.put("/api/sensores/{codigo}/estado", tags=["Sensores"])
+def cambiar_estado_sensor(codigo: str, estado_update: SensorUpdate,
+                          current_user: UsuarioDB = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    
+    if current_user.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403, detail="Solo el Administrador puede gestionar estados")
+
+    sensor = db.query(SensorDB).filter(
+        SensorDB.codigo_sensor == codigo,
+        SensorDB.id_departamento == current_user.id_departamento
+    ).first()
+
+    if not sensor:
+        raise HTTPException(status_code=404, detail="Sensor no encontrado en tu departamento")
+
+    # Estados validos: ACTIVO, INACTIVO, PERDIDO, BLOQUEADO
+    sensor.estado = estado_update.estado.upper()
+    db.commit()
+    return {"msg": f"Sensor {codigo} actualizado a {sensor.estado}"}
+
+@app.get("/api/sensores", tags=["Sensores"])
+def listar_mis_sensores(current_user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Muestra todos los sensores del departamento del usuario"""
     return db.query(SensorDB).filter(SensorDB.id_departamento == current_user.id_departamento).all()
 
-@app.put("/api/sensores/{codigo_sensor}")
-def actualizar_estado(codigo_sensor: str, estado: SensorUpdate, 
-                      current_user: UsuarioDB = Depends(get_current_user), 
-                      db: Session = Depends(get_db)):
-    if current_user.rol != "ADMINISTRADOR":
-        raise HTTPException(status_code=403, detail="No autorizado")
-    
-    sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == codigo_sensor).first()
-    if not sensor: raise HTTPException(404, "Sensor no encontrado")
-    
-    sensor.estado = estado.estado
-    db.commit()
-    return {"msg": "Estado actualizado"}
+# --- C. CONTROL MANUAL (APP MÓVIL) ---
 
-# --- C. CONTROL DE BARRERA (App -> Server -> ESP32) ---
-
-# 1. La App manda la orden
-@app.post("/api/barrera/comando")
-def enviar_comando_barrera(cmd: BarreraCmd, 
+@app.post("/api/barrera/manual", tags=["Control Acceso App"])
+def control_manual_barrera(cmd: BarreraManual, 
                            current_user: UsuarioDB = Depends(get_current_user), 
                            db: Session = Depends(get_db)):
+    """
+    La App envía ABRIR o CERRAR.
+    Se registra el evento y se asume que la nube notifica al hardware (simulado).
+    """
+    accion = cmd.accion.upper() # ABRIR o CERRAR
     
-    # Registrar evento
     evento = EventoAccesoDB(
-        tipo_evento="APP_MANUAL",
+        tipo_evento=f"APP_{accion}",
         resultado="PERMITIDO",
-        usuario_nombre=current_user.nombre
+        descripcion=f"Acción manual por usuario: {current_user.nombre}",
+        id_departamento=current_user.id_departamento
     )
     db.add(evento)
-    
-    # Encolar comando para el ESP32 (asociado al depto)
-    nuevo_cmd = ComandoPendienteDB(
-        destino=str(current_user.id_departamento), # O usa un identificador fijo si hay 1 sola barrera
-        accion="ABRIR",
-        procesado=False
-    )
-    db.add(nuevo_cmd)
     db.commit()
-    return {"msg": "Comando enviado a la barrera"}
 
-# 2. El ESP32 pregunta si hay órdenes (Polling)
-@app.get("/api/esp32/comandos")
-def verificar_comandos_pendientes(db: Session = Depends(get_db)):
-    # Busca comandos no procesados. 
-    # Para simplificar, si encuentra CUALQUIERA sin procesar, devuelve abrir.
-    cmd = db.query(ComandoPendienteDB).filter(ComandoPendienteDB.procesado == False).first()
-    
-    if cmd:
-        cmd.procesado = True # Marcar como leído
-        db.commit()
-        return {"accion": "ABRIR"}
-    
-    return {"accion": "NADA"}
+    return {
+        "msg": f"Comando {accion} enviado exitosamente",
+        "barrera_estado": "ABIERTA" if accion == "ABRIR" else "CERRADA"
+    }
 
-# 3. El ESP32 valida acceso RFID
-class ValidacionRequest(BaseModel):
-    uid: str
+# --- D. SIMULACIÓN HARDWARE (Validador RFID) ---
 
-@app.post("/api/esp32/validar")
-def validar_rfid(req: ValidacionRequest, db: Session = Depends(get_db)):
-    sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == req.uid).first()
+@app.post("/api/simulacion/validar", tags=["Simulación IoT"])
+def validar_acceso_rfid(rfid: SimulacionRFID, db: Session = Depends(get_db)):
+    """
+    Simula lo que haría el ESP32: Envia el UID leido.
+    La API responde si abre o no y registra el evento.
+    """
+    sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == rfid.uid).first()
     
-    evt = EventoAccesoDB(tipo_evento="RFID_INTENTO", usuario_nombre="Desconocido")
-    
+    # 1. Caso: Sensor no existe
     if not sensor:
-        evt.resultado = "DENEGADO_DESCONOCIDO"
+        evt = EventoAccesoDB(
+            tipo_evento="RFID_DENEGADO", 
+            resultado="DENEGADO", 
+            descripcion=f"Intento con tarjeta desconocida: {rfid.uid}",
+            id_departamento=None
+        )
         db.add(evt); db.commit()
-        return {"acceso": False}
-    
-    evt.usuario_nombre = f"Depto {sensor.id_departamento}"
-    
+        return {"acceso": False, "mensaje": "Tarjeta no registrada", "led": "ROJO"}
+
+    # 2. Caso: Sensor existe, verificamos estado
     if sensor.estado != "ACTIVO":
-        evt.resultado = f"DENEGADO_{sensor.estado}"
+        evt = EventoAccesoDB(
+            tipo_evento="RFID_DENEGADO",
+            resultado="DENEGADO",
+            descripcion=f"Sensor {sensor.estado} intentó acceder (Depto {sensor.id_departamento})",
+            id_departamento=sensor.id_departamento
+        )
         db.add(evt); db.commit()
-        return {"acceso": False}
-    
-    # Validar usuario dueño del sensor (Opcional, se puede expandir)
-    
-    evt.resultado = "PERMITIDO"
+        return {"acceso": False, "mensaje": f"Tarjeta {sensor.estado}", "led": "ROJO"}
+
+    # 3. Caso: Éxito
+    evt = EventoAccesoDB(
+        tipo_evento="RFID_VALIDO",
+        resultado="PERMITIDO",
+        descripcion=f"Entrada autorizada Depto {sensor.id_departamento} ({sensor.tipo})",
+        id_departamento=sensor.id_departamento
+    )
     db.add(evt); db.commit()
-    return {"acceso": True}
+    
+    return {
+        "acceso": True, 
+        "mensaje": "Bienvenido", 
+        "led": "VERDE",
+        "accion_barrera": "LEVANTAR_Y_BAJAR_10S"
+    }
 
-# --- D. HISTORIAL ---
-@app.get("/api/historial")
+# --- E. HISTORIAL ---
+
+@app.get("/api/historial", response_model=List[EventoOut], tags=["Historial"])
 def ver_historial(current_user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    return db.query(EventoAccesoDB).order_by(EventoAccesoDB.fecha_hora.desc()).limit(30).all()
-
-# --- SETUP INICIAL ---
-@app.post("/setup")
-def setup_inicial(db: Session = Depends(get_db)):
-    if not db.query(UsuarioDB).first():
-        depto = DepartamentoDB(numero="101")
-        db.add(depto)
-        db.commit()
-        db.refresh(depto)
-        
-        # Admin: pass = admin123
-        hashed = get_password_hash("admin123")
-        admin = UsuarioDB(email="admin@test.com", nombre="Admin Jefe", hashed_password=hashed, rol="ADMINISTRADOR", id_departamento=depto.id_departamento)
-        
-        # Operador: pass = user123
-        hashed_op = get_password_hash("user123")
-        user = UsuarioDB(email="user@test.com", nombre="Vecino Juan", hashed_password=hashed_op, rol="OPERADOR", id_departamento=depto.id_departamento)
-        
-        db.add(admin)
-        db.add(user)
-        db.commit()
-        return {"msg": "Usuarios creados: admin@test.com / user@test.com"}
-    return {"msg": "Ya existen datos"}
+    """
+    Muestra el historial. 
+    - Si es Admin, podría ver todo (opcional).
+    - Aquí configurado para ver SOLO eventos de SU departamento.
+    """
+    return db.query(EventoAccesoDB)\
+             .filter(EventoAccesoDB.id_departamento == current_user.id_departamento)\
+             .order_by(EventoAccesoDB.fecha_hora.desc())\
+             .limit(50)\
+             .all()
