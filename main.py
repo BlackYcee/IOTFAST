@@ -10,7 +10,11 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import bcrypt
 
-# --- PARCHE Y CONFIGURACIÓN ---
+# ==========================================
+# 1. CONFIGURACIÓN Y PARCHES
+# ==========================================
+
+# Parche para compatibilidad de bcrypt
 if not hasattr(bcrypt, "__about__"):
     bcrypt.__about__ = type('About', (object,), {'__version__': bcrypt.__version__})
 
@@ -19,17 +23,24 @@ ALGORITHM = "HS256"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
+# ==========================================
+# 2. CONFIGURACIÓN DE BASE DE DATOS
+# ==========================================
+
 DATABASE_URL = "sqlite:///./condominio_final.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELOS DE BASE DE DATOS ---
+# ==========================================
+# 3. MODELOS DE BASE DE DATOS (SQLAlchemy)
+# ==========================================
 
 class DepartamentoDB(Base):
     __tablename__ = "departamentos"
     id_departamento = Column(Integer, primary_key=True, index=True)
     numero = Column(String)
+    
     usuarios = relationship("UsuarioDB", back_populates="departamento")
     sensores = relationship("SensorDB", back_populates="departamento")
 
@@ -68,32 +79,12 @@ class EventoAccesoDB(Base):
     
     usuario = relationship("UsuarioDB", back_populates="eventos")
 
+# Crear tablas
 Base.metadata.create_all(bind=engine)
 
-# --- DEPENDENCIAS ---
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(status_code=401, detail="No se pudo validar credenciales")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    user = db.query(UsuarioDB).filter(UsuarioDB.email == email).first()
-    if user is None:
-        raise credentials_exception
-    return user
-
-# --- ESQUEMAS PYDANTIC ---
+# ==========================================
+# 4. ESQUEMAS DE DATOS (Pydantic)
+# ==========================================
 
 class UserBase(BaseModel):
     nombre: str
@@ -128,9 +119,42 @@ class EventoResponse(BaseModel):
     id_usuario: int
     class Config: from_attributes = True
 
+# ==========================================
+# 5. DEPENDENCIAS
+# ==========================================
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, 
+        detail="No se pudo validar credenciales"
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    user = db.query(UsuarioDB).filter(UsuarioDB.email == email).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+# ==========================================
+# 6. INICIALIZACIÓN DE APP Y ENDPOINTS
+# ==========================================
+
 app = FastAPI(title="Control de Acceso IoT")
 
-# --- ENDPOINTS DE AUTENTICACIÓN ---
+# --- Autenticación ---
 
 @app.post("/token")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -139,9 +163,14 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         raise HTTPException(status_code=400, detail="Email o contraseña incorrectos")
     
     token = jwt.encode({"sub": user.email}, SECRET_KEY, algorithm=ALGORITHM)
-    return {"access_token": token, "token_type": "bearer", "rol": user.rol}
+    return {
+        "access_token": token, 
+        "token_type": "bearer", 
+        "rol": user.rol, 
+        "user_id": user.id_usuario
+    }
 
-# --- CRUD USUARIOS (ADMIN) ---
+# --- CRUD Usuarios (Sólo ADMIN) ---
 
 @app.post("/api/usuarios", response_model=UserResponse)
 def crear_usuario(user_data: UserCreate, current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -176,7 +205,7 @@ def eliminar_usuario(id_usuario: int, current_admin: UsuarioDB = Depends(get_cur
     db.commit()
     return {"msg": "Usuario eliminado"}
 
-# --- GESTIÓN DE SENSORES ---
+# --- Gestión de Sensores ---
 
 @app.post("/api/sensores", response_model=SensorResponse)
 def registrar_sensor(data: SensorCreate, user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -188,6 +217,12 @@ def registrar_sensor(data: SensorCreate, user: UsuarioDB = Depends(get_current_u
     db.refresh(nuevo)
     return nuevo
 
+@app.get("/api/sensores", response_model=List[SensorResponse])
+def listar_sensores(current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_admin.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403)
+    return db.query(SensorDB).all()
+    
 @app.patch("/api/sensores/{id_sensor}/toggle")
 def alternar_estado_sensor(id_sensor: int, current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_admin.rol != "ADMINISTRADOR":
@@ -199,22 +234,19 @@ def alternar_estado_sensor(id_sensor: int, current_admin: UsuarioDB = Depends(ge
     db.commit()
     return {"msg": f"Sensor {'activado' if sensor.activo else 'desactivado'}", "activo": sensor.activo}
 
-# --- AUDITORÍA Y EVENTOS ---
+# --- Auditoría y Eventos ---
 
 @app.get("/api/usuarios/{id_usuario}/historial", response_model=List[EventoResponse])
 def historial_por_usuario(id_usuario: int, db: Session = Depends(get_db), current_user: UsuarioDB = Depends(get_current_user)):
-    # Un usuario solo puede ver su historial, a menos que sea Admin
     if current_user.rol != "ADMINISTRADOR" and current_user.id_usuario != id_usuario:
         raise HTTPException(status_code=403)
-    
     return db.query(EventoAccesoDB).filter(EventoAccesoDB.id_usuario == id_usuario).all()
 
-# --- ENDPOINT PARA DISPOSITIVO IOT ---
+# --- Endpoint para Dispositivo IoT ---
 
 @app.get("/api/iot/validar")
 def validar_rfid(uid: str, db: Session = Depends(get_db)):
     sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == uid).first()
-    
     if sensor and sensor.activo:
         evento = EventoAccesoDB(
             tipo_evento="RFID_ACCESO",
@@ -225,10 +257,9 @@ def validar_rfid(uid: str, db: Session = Depends(get_db)):
         db.add(evento)
         db.commit()
         return {"access": True, "user": sensor.usuario.nombre}
-    
     return {"access": False, "msg": "Denegado o Inactivo"}
 
-# --- SETUP INICIAL ---
+# --- Setup Inicial ---
 
 @app.post("/setup")
 def setup(db: Session = Depends(get_db)):
