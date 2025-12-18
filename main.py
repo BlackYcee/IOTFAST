@@ -1,177 +1,252 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime, timedelta, timezone
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
 from sqlalchemy.sql import func
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import bcrypt
 
-# --- PARCHE DE COMPATIBILIDAD BCRYPT/PASSLIB ---
-# Esto evita el error "AttributeError: module 'bcrypt' has no attribute '__about__'"
+# --- PARCHE Y CONFIGURACIÓN ---
 if not hasattr(bcrypt, "__about__"):
     bcrypt.__about__ = type('About', (object,), {'__version__': bcrypt.__version__})
 
-# --- 1. CONFIGURACIÓN Y SEGURIDAD ---
-SECRET_KEY = "PROYECTO_TITULO_SECRET_KEY"
+SECRET_KEY = "TI3V42_LA_SERENA_SECRET"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 120
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./condominio_cloud.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+DATABASE_URL = "sqlite:///./condominio_final.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="Control de Acceso API", version="2.5")
-
-# --- 2. MODELOS DE BASE DE DATOS (SQLAlchemy) ---
+# --- MODELOS DE BASE DE DATOS ---
 
 class DepartamentoDB(Base):
     __tablename__ = "departamentos"
-    id = Column(Integer, primary_key=True, index=True)
-    numero = Column(String, index=True)
-    torre = Column(String, nullable=True)
+    id_departamento = Column(Integer, primary_key=True, index=True)
+    numero = Column(String)
     usuarios = relationship("UsuarioDB", back_populates="departamento")
     sensores = relationship("SensorDB", back_populates="departamento")
 
 class UsuarioDB(Base):
     __tablename__ = "usuarios"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True)
+    id_usuario = Column(Integer, primary_key=True, index=True)
     nombre = Column(String)
-    hashed_password = Column(String)
-    rol = Column(String, default="OPERADOR")
-    id_departamento = Column(Integer, ForeignKey("departamentos.id"))
+    email = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    rol = Column(String)  # ADMINISTRADOR / OPERADOR
+    id_departamento = Column(Integer, ForeignKey("departamentos.id_departamento"))
+    
     departamento = relationship("DepartamentoDB", back_populates="usuarios")
+    eventos = relationship("EventoAccesoDB", back_populates="usuario")
 
 class SensorDB(Base):
     __tablename__ = "sensores"
-    id = Column(Integer, primary_key=True, index=True)
-    codigo_sensor = Column(String, unique=True, index=True)
-    estado = Column(String, default="ACTIVO")
-    tipo = Column(String)
-    id_departamento = Column(Integer, ForeignKey("departamentos.id"))
+    id_sensor = Column(Integer, primary_key=True, index=True)
+    codigo_sensor = Column(String, unique=True)
+    tipo = Column(String)  # Llavero / Tarjeta
+    activo = Column(Boolean, default=True)
+    id_departamento = Column(Integer, ForeignKey("departamentos.id_departamento"))
+    id_usuario = Column(Integer, ForeignKey("usuarios.id_usuario"))
+    
     departamento = relationship("DepartamentoDB", back_populates="sensores")
+    usuario = relationship("UsuarioDB")
 
-class EventoDB(Base):
-    __tablename__ = "eventos"
-    id = Column(Integer, primary_key=True, index=True)
+class EventoAccesoDB(Base):
+    __tablename__ = "eventos_acceso"
+    id_evento = Column(Integer, primary_key=True, index=True)
+    tipo_evento = Column(String)
+    resultado = Column(String)  # PERMITIDO / DENEGADO
     fecha_hora = Column(DateTime, default=func.now())
-    tipo = Column(String)
-    resultado = Column(String)
-    descripcion = Column(String)
-    id_departamento = Column(Integer, nullable=True)
+    id_usuario = Column(Integer, ForeignKey("usuarios.id_usuario"))
+    id_departamento = Column(Integer)
+    
+    usuario = relationship("UsuarioDB", back_populates="eventos")
 
 Base.metadata.create_all(bind=engine)
 
-# --- 3. ESQUEMAS DE DATOS (Pydantic v2) ---
-
-class SensorBase(BaseModel):
-    codigo_sensor: str
-    tipo: str
-
-class SensorResponse(SensorBase):
-    id: int
-    estado: str
-    class Config:
-        from_attributes = True
-
-class EventoResponse(BaseModel):
-    id: int
-    fecha_hora: datetime
-    tipo: str
-    resultado: str
-    descripcion: str
-    id_departamento: Optional[int]
-    class Config:
-        from_attributes = True
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str
-    nombre: str
-    rol: str
-
-# --- 4. DEPENDENCIAS ---
+# --- DEPENDENCIAS ---
 
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    exc = HTTPException(status_code=401, detail="Token inválido")
+    credentials_exception = HTTPException(status_code=401, detail="No se pudo validar credenciales")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email = payload.get("sub")
-        if not email: raise exc
-    except JWTError: raise exc
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
     user = db.query(UsuarioDB).filter(UsuarioDB.email == email).first()
-    if not user: raise exc
+    if user is None:
+        raise credentials_exception
     return user
 
-# --- 5. ENDPOINTS ---
+# --- ESQUEMAS PYDANTIC ---
 
-@app.post("/setup", tags=["Admin"])
-def setup_db(db: Session = Depends(get_db)):
-    if db.query(UsuarioDB).first():
-        return {"message": "La base de datos ya está inicializada"}
-    
-    depto = DepartamentoDB(numero="101", torre="A")
-    db.add(depto); db.commit(); db.refresh(depto)
-    
-    admin = UsuarioDB(
-        email="admin@condominio.cl", 
-        nombre="Admin Jefe", 
-        hashed_password=pwd_context.hash("admin123"), 
-        rol="ADMINISTRADOR",
-        id_departamento=depto.id
-    )
-    db.add(admin); db.commit()
-    return {"message": "Sistema inicializado", "admin": "admin@condominio.cl"}
+class UserBase(BaseModel):
+    nombre: str
+    email: str
+    rol: str
+    id_departamento: int
 
-@app.post("/token", response_model=TokenResponse, tags=["Auth"])
+class UserCreate(UserBase):
+    password: str
+
+class UserResponse(UserBase):
+    id_usuario: int
+    class Config: from_attributes = True
+
+class SensorCreate(BaseModel):
+    codigo_sensor: str
+    tipo: str
+    id_usuario: int
+
+class SensorResponse(BaseModel):
+    id_sensor: int
+    codigo_sensor: str
+    activo: bool
+    tipo: str
+    class Config: from_attributes = True
+
+class EventoResponse(BaseModel):
+    id_evento: int
+    tipo_evento: str
+    resultado: str
+    fecha_hora: datetime
+    id_usuario: int
+    class Config: from_attributes = True
+
+app = FastAPI(title="Control de Acceso IoT")
+
+# --- ENDPOINTS DE AUTENTICACIÓN ---
+
+@app.post("/token")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UsuarioDB).filter(UsuarioDB.email == form_data.username).first()
-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Credenciales incorrectas")
+    if not user or not pwd_context.verify(form_data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Email o contraseña incorrectos")
     
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token = jwt.encode({"sub": user.email, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
-    return {"access_token": token, "token_type": "bearer", "nombre": user.nombre, "rol": user.rol}
+    token = jwt.encode({"sub": user.email}, SECRET_KEY, algorithm=ALGORITHM)
+    return {"access_token": token, "token_type": "bearer", "rol": user.rol}
 
-@app.get("/api/sensores", response_model=List[SensorResponse], tags=["Sensores"])
-def listar_sensores(user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    return db.query(SensorDB).filter(SensorDB.id_departamento == user.id_departamento).all()
+# --- CRUD USUARIOS (ADMIN) ---
 
-@app.post("/api/sensores", response_model=SensorResponse, tags=["Sensores"])
-def crear_sensor(data: SensorBase, user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    if user.rol != "ADMINISTRADOR":
+@app.post("/api/usuarios", response_model=UserResponse)
+def crear_usuario(user_data: UserCreate, current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_admin.rol != "ADMINISTRADOR":
         raise HTTPException(status_code=403, detail="No tienes permisos")
     
-    nuevo = SensorDB(codigo_sensor=data.codigo_sensor, tipo=data.tipo, id_departamento=user.id_departamento)
-    db.add(nuevo); db.commit(); db.refresh(nuevo)
+    hashed_pw = pwd_context.hash(user_data.password)
+    nuevo_usuario = UsuarioDB(
+        nombre=user_data.nombre,
+        email=user_data.email,
+        password_hash=hashed_pw,
+        rol=user_data.rol,
+        id_departamento=user_data.id_departamento
+    )
+    db.add(nuevo_usuario)
+    db.commit()
+    db.refresh(nuevo_usuario)
+    return nuevo_usuario
+
+@app.get("/api/usuarios", response_model=List[UserResponse])
+def listar_usuarios(current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.query(UsuarioDB).all()
+
+@app.delete("/api/usuarios/{id_usuario}")
+def eliminar_usuario(id_usuario: int, current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_admin.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403)
+    user = db.query(UsuarioDB).filter(UsuarioDB.id_usuario == id_usuario).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    db.delete(user)
+    db.commit()
+    return {"msg": "Usuario eliminado"}
+
+# --- GESTIÓN DE SENSORES ---
+
+@app.post("/api/sensores", response_model=SensorResponse)
+def registrar_sensor(data: SensorCreate, user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403)
+    nuevo = SensorDB(**data.model_dump(), id_departamento=user.id_departamento, activo=True)
+    db.add(nuevo)
+    db.commit()
+    db.refresh(nuevo)
     return nuevo
 
-@app.post("/api/simulacion/validar", tags=["IoT"])
+@app.patch("/api/sensores/{id_sensor}/toggle")
+def alternar_estado_sensor(id_sensor: int, current_admin: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_admin.rol != "ADMINISTRADOR":
+        raise HTTPException(status_code=403)
+    sensor = db.query(SensorDB).filter(SensorDB.id_sensor == id_sensor).first()
+    if not sensor:
+        raise HTTPException(status_code=404)
+    sensor.activo = not sensor.activo
+    db.commit()
+    return {"msg": f"Sensor {'activado' if sensor.activo else 'desactivado'}", "activo": sensor.activo}
+
+# --- AUDITORÍA Y EVENTOS ---
+
+@app.get("/api/usuarios/{id_usuario}/historial", response_model=List[EventoResponse])
+def historial_por_usuario(id_usuario: int, db: Session = Depends(get_db), current_user: UsuarioDB = Depends(get_current_user)):
+    # Un usuario solo puede ver su historial, a menos que sea Admin
+    if current_user.rol != "ADMINISTRADOR" and current_user.id_usuario != id_usuario:
+        raise HTTPException(status_code=403)
+    
+    return db.query(EventoAccesoDB).filter(EventoAccesoDB.id_usuario == id_usuario).all()
+
+# --- ENDPOINT PARA DISPOSITIVO IOT ---
+
+@app.get("/api/iot/validar")
 def validar_rfid(uid: str, db: Session = Depends(get_db)):
     sensor = db.query(SensorDB).filter(SensorDB.codigo_sensor == uid).first()
-    if not sensor or sensor.estado != "ACTIVO":
-        return {"acceso": False, "led": "ROJO", "msg": "Denegado"}
     
-    nuevo_evento = EventoDB(tipo="RFID", resultado="EXITO", descripcion=f"Acceso UID: {uid}", id_departamento=sensor.id_departamento)
-    db.add(nuevo_evento); db.commit()
-    return {"acceso": True, "led": "VERDE", "accion": "ABRIR_BARRERA"}
+    if sensor and sensor.activo:
+        evento = EventoAccesoDB(
+            tipo_evento="RFID_ACCESO",
+            resultado="PERMITIDO",
+            id_usuario=sensor.id_usuario,
+            id_departamento=sensor.id_departamento
+        )
+        db.add(evento)
+        db.commit()
+        return {"access": True, "user": sensor.usuario.nombre}
+    
+    return {"access": False, "msg": "Denegado o Inactivo"}
 
-@app.get("/api/eventos", response_model=List[EventoResponse], tags=["Auditoría"])
-def listar_eventos(user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    query = db.query(EventoDB)
-    if user.rol != "ADMINISTRADOR":
-        query = query.filter(EventoDB.id_departamento == user.id_departamento)
-    return query.order_by(EventoDB.fecha_hora.desc()).all()
+# --- SETUP INICIAL ---
+
+@app.post("/setup")
+def setup(db: Session = Depends(get_db)):
+    if db.query(DepartamentoDB).first():
+        return {"msg": "El sistema ya está configurado"}
+    
+    dep = DepartamentoDB(numero="101")
+    db.add(dep)
+    db.commit()
+    db.refresh(dep)
+    
+    admin = UsuarioDB(
+        nombre="Admin Jose",
+        email="admin@test.com",
+        password_hash=pwd_context.hash("123"),
+        rol="ADMINISTRADOR",
+        id_departamento=dep.id_departamento
+    )
+    db.add(admin)
+    db.commit()
+    return {"msg": "Admin creado: admin@test.com / 123"}
