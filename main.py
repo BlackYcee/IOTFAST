@@ -281,3 +281,4 @@ def setup(db: Session = Depends(get_db)):
     db.add(admin)
     db.commit()
     return {"msg": "Admin creado: admin@test.com / 123"}
+#jaja
