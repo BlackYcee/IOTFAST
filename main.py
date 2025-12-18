@@ -1,11 +1,10 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
 from sqlalchemy.sql import func
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -25,7 +24,7 @@ Base = declarative_base()
 
 app = FastAPI(title="Control de Acceso API", version="2.0")
 
-# --- 2. MODELOS DE BASE DE DATOS (SQLAlchemy) ---
+# --- 2. MODELOS DE BASE DE DATOS ---
 
 class DepartamentoDB(Base):
     __tablename__ = "departamentos"
@@ -49,7 +48,7 @@ class UsuarioDB(Base):
 class SensorDB(Base):
     __tablename__ = "sensores"
     id = Column(Integer, primary_key=True, index=True)
-    codigo_sensor = Column(String, unique=True, index=True)
+    codigo_sensor = Column(String, unique=True, index=True) # Nombre en DB
     estado = Column(String, default="ACTIVO")
     tipo = Column(String)
     id_departamento = Column(Integer, ForeignKey("departamentos.id"))
@@ -66,17 +65,19 @@ class EventoDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- 3. ESQUEMAS DE DATOS (Pydantic v2 - JSON) ---
+# --- 3. ESQUEMAS DE DATOS (Pydantic) ---
 
 class SensorBase(BaseModel):
-    codigo: str
+    codigo_sensor: str  # Cambiado para coincidir con el modelo DB
     tipo: str
 
-class SensorResponse(SensorBase):
+class SensorResponse(BaseModel):
     id: int
+    codigo_sensor: str
+    tipo: str
     estado: str
     class Config:
-        from_attributes = True  # Esto reemplaza orm_mode en Pydantic V2
+        from_attributes = True
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -84,11 +85,7 @@ class TokenResponse(BaseModel):
     nombre: str
     rol: str
 
-class MsgResponse(BaseModel):
-    message: str
-    detail: Optional[str] = None
-
-# --- 4. DEPENDENCIAS Y UTILS ---
+# --- 4. DEPENDENCIAS ---
 
 def get_db():
     db = SessionLocal()
@@ -99,14 +96,14 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     exc = HTTPException(status_code=401, detail="Token inválido")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email = payload.get("sub")
-        if not email: raise exc
+        email: str = payload.get("sub")
+        if email is None: raise exc
     except JWTError: raise exc
     user = db.query(UsuarioDB).filter(UsuarioDB.email == email).first()
-    if not user: raise exc
+    if user is None: raise exc
     return user
 
-# --- 5. ENDPOINTS (API REST) ---
+# --- 5. ENDPOINTS ---
 
 @app.post("/setup", tags=["Admin"])
 def setup_db(db: Session = Depends(get_db)):
@@ -132,13 +129,9 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     if not user or not pwd_context.verify(form_data.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Credenciales incorrectas")
     
-    token = jwt.encode({"sub": user.email, "exp": datetime.utcnow() + timedelta(minutes=120)}, SECRET_KEY, algorithm=ALGORITHM)
-    return {
-        "access_token": token, 
-        "token_type": "bearer", 
-        "nombre": user.nombre, 
-        "rol": user.rol
-    }
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = jwt.encode({"sub": user.email, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+    return {"access_token": token, "token_type": "bearer", "nombre": user.nombre, "rol": user.rol}
 
 @app.get("/api/sensores", response_model=List[SensorResponse], tags=["Sensores"])
 def listar_sensores(user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -149,7 +142,7 @@ def crear_sensor(data: SensorBase, user: UsuarioDB = Depends(get_current_user), 
     if user.rol != "ADMINISTRADOR":
         raise HTTPException(status_code=403, detail="No tienes permisos")
     
-    nuevo = SensorDB(codigo_sensor=data.codigo, tipo=data.tipo, id_departamento=user.id_departamento)
+    nuevo = SensorDB(codigo_sensor=data.codigo_sensor, tipo=data.tipo, id_departamento=user.id_departamento)
     db.add(nuevo); db.commit(); db.refresh(nuevo)
     return nuevo
 
@@ -159,7 +152,6 @@ def validar_rfid(uid: str, db: Session = Depends(get_db)):
     if not sensor or sensor.estado != "ACTIVO":
         return {"acceso": False, "led": "ROJO", "msg": "Denegado"}
     
-    # Registrar evento
     nuevo_evento = EventoDB(tipo="RFID", resultado="EXITO", descripcion=f"Acceso UID: {uid}", id_departamento=sensor.id_departamento)
     db.add(nuevo_evento); db.commit()
     return {"acceso": True, "led": "VERDE", "accion": "ABRIR_BARRERA"}
