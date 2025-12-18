@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
@@ -8,6 +8,12 @@ from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
 from sqlalchemy.sql import func
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+import bcrypt
+
+# --- PARCHE DE COMPATIBILIDAD BCRYPT/PASSLIB ---
+# Esto evita el error "AttributeError: module 'bcrypt' has no attribute '__about__'"
+if not hasattr(bcrypt, "__about__"):
+    bcrypt.__about__ = type('About', (object,), {'__version__': bcrypt.__version__})
 
 # --- 1. CONFIGURACIÓN Y SEGURIDAD ---
 SECRET_KEY = "PROYECTO_TITULO_SECRET_KEY"
@@ -22,9 +28,9 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="Control de Acceso API", version="2.0")
+app = FastAPI(title="Control de Acceso API", version="2.5")
 
-# --- 2. MODELOS DE BASE DE DATOS ---
+# --- 2. MODELOS DE BASE DE DATOS (SQLAlchemy) ---
 
 class DepartamentoDB(Base):
     __tablename__ = "departamentos"
@@ -41,14 +47,13 @@ class UsuarioDB(Base):
     nombre = Column(String)
     hashed_password = Column(String)
     rol = Column(String, default="OPERADOR")
-    estado = Column(String, default="ACTIVO")
     id_departamento = Column(Integer, ForeignKey("departamentos.id"))
     departamento = relationship("DepartamentoDB", back_populates="usuarios")
 
 class SensorDB(Base):
     __tablename__ = "sensores"
     id = Column(Integer, primary_key=True, index=True)
-    codigo_sensor = Column(String, unique=True, index=True) # Nombre en DB
+    codigo_sensor = Column(String, unique=True, index=True)
     estado = Column(String, default="ACTIVO")
     tipo = Column(String)
     id_departamento = Column(Integer, ForeignKey("departamentos.id"))
@@ -65,17 +70,25 @@ class EventoDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- 3. ESQUEMAS DE DATOS (Pydantic) ---
+# --- 3. ESQUEMAS DE DATOS (Pydantic v2) ---
 
 class SensorBase(BaseModel):
-    codigo_sensor: str  # Cambiado para coincidir con el modelo DB
-    tipo: str
-
-class SensorResponse(BaseModel):
-    id: int
     codigo_sensor: str
     tipo: str
+
+class SensorResponse(SensorBase):
+    id: int
     estado: str
+    class Config:
+        from_attributes = True
+
+class EventoResponse(BaseModel):
+    id: int
+    fecha_hora: datetime
+    tipo: str
+    resultado: str
+    descripcion: str
+    id_departamento: Optional[int]
     class Config:
         from_attributes = True
 
@@ -96,11 +109,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     exc = HTTPException(status_code=401, detail="Token inválido")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None: raise exc
+        email = payload.get("sub")
+        if not email: raise exc
     except JWTError: raise exc
     user = db.query(UsuarioDB).filter(UsuarioDB.email == email).first()
-    if user is None: raise exc
+    if not user: raise exc
     return user
 
 # --- 5. ENDPOINTS ---
@@ -155,3 +168,10 @@ def validar_rfid(uid: str, db: Session = Depends(get_db)):
     nuevo_evento = EventoDB(tipo="RFID", resultado="EXITO", descripcion=f"Acceso UID: {uid}", id_departamento=sensor.id_departamento)
     db.add(nuevo_evento); db.commit()
     return {"acceso": True, "led": "VERDE", "accion": "ABRIR_BARRERA"}
+
+@app.get("/api/eventos", response_model=List[EventoResponse], tags=["Auditoría"])
+def listar_eventos(user: UsuarioDB = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(EventoDB)
+    if user.rol != "ADMINISTRADOR":
+        query = query.filter(EventoDB.id_departamento == user.id_departamento)
+    return query.order_by(EventoDB.fecha_hora.desc()).all()
